@@ -80,6 +80,3 @@ If a file path is given, it's loaded on startup. Otherwise, Linotepad opens with
 - Undo is intentionally not implemented — `GtkTextBuffer` has no built-in undo stack; that would require `GtkSourceView` as an additional dependency.
 - Font size set via Format → Font stays in sync with the zoom controls.
 
-## License
-
-Licensed under the Apache License, Version 2.0.
