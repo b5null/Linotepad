@@ -1,7 +1,7 @@
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=LinoPad
+Name=Linotepad
 GenericName=Text Editor
 Comment=Simple GTK text editor
 Exec=linotepad %F
