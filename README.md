@@ -1,7 +1,5 @@
 # Linotepad
 
-![Linotepad](linotepad.png)
-
 A lightweight **Notepad-style text editor for Linux**, built with GTK3.
 
 Linotepad is a from-scratch reimplementation inspired by Microsoft's classic **Notepad**. Since the original application depends on Win32 APIs (RichEdit, HMENU, Common Dialogs, etc.), this project recreates the same look and core functionality using native GTK3 widgets on Linux.
@@ -164,10 +162,6 @@ linotepad myfile.txt
 Linotepad was created as a lightweight alternative to heavier graphical text editors, providing a familiar Notepad-like experience while remaining fast, responsive, and extremely small.
 
 ---
-
-## Disclaimer
-
-I do not own the icon image.
 
 ## License
 
