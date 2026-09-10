@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>Linotepad</title>
+  <path fill="#153f46" d="M10 8h44v40L42 60H10z"/>
+  <path fill="#e2dbc3" d="M13 19h38v28L41 57H13z"/>
+  <path fill="#fff8e4" d="M13 17h38v27H39v10H13z"/>
+  <path fill="#168c91" d="M13 11h38v10H13z"/>
+  <path fill="#58cfca" d="M13 11h38v3H13z"/>
+  <path fill="#153f46" d="M18 5h5v12h-5zm23 0h5v12h-5z"/>
+  <path fill="#c1efdd" d="M19 6h2v8h-2zm23 0h2v8h-2z"/>
+  <path fill="#38616a" d="M19 28h26v3H19zm0 9h26v3H19zm0 9h13v3H19z"/>
+  <path fill="#168c91" d="M42 47h8l-8 8z"/>
+</svg>

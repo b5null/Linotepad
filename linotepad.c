@@ -15,6 +15,11 @@ typedef struct {
 } EditAction;
 
 typedef struct {
+    GList *actions;            /* newest action first */
+    guint64 before, after;     /* document revision IDs */
+} EditGroup;
+
+typedef struct {
     GtkWidget *window;
     GtkWidget *textview;
     GtkTextBuffer *buffer;
@@ -28,6 +33,9 @@ typedef struct {
     gboolean   applying_history;
     GList     *undo_stack;
     GList     *redo_stack;
+    EditGroup *active_group;
+    guint      action_depth;
+    guint64    revision, saved_revision, next_revision;
 
     /* Find/Replace state */
     gchar     *find_text;
@@ -35,11 +43,15 @@ typedef struct {
     gboolean   match_case;
 
     /* Zoom state */
+    PangoFontDescription *font;
     gint       font_size;
+    gint       base_font_size;
+    gdouble    scroll_zoom_delta;
+    guint32    last_scroll_time;
 } AppState;
 
 static gint open_windows = 0;
-static GtkWidget *create_window(const gchar *path);
+static AppState *create_window(const gchar *path);
 
 static void update_title(AppState *app) {
     gchar *base = app->filename
@@ -52,9 +64,10 @@ static void update_title(AppState *app) {
     g_free(base);
 }
 
-static void mark_dirty(AppState *app) {
-    if (!app->dirty) {
-        app->dirty = TRUE;
+static void update_dirty(AppState *app) {
+    gboolean dirty = app->revision != app->saved_revision;
+    if (app->dirty != dirty) {
+        app->dirty = dirty;
         update_title(app);
     }
 }
@@ -66,7 +79,8 @@ static void update_status(AppState *app) {
     gtk_text_buffer_get_iter_at_mark(app->buffer, &iter, mark);
     int line = gtk_text_iter_get_line(&iter) + 1;
     int col  = gtk_text_iter_get_line_offset(&iter) + 1;
-    gchar *msg = g_strdup_printf("  Ln %d, Col %d", line, col);
+    gchar *msg = g_strdup_printf("  Ln %d, Col %d    %d%%", line, col,
+        app->font_size * 100 / app->base_font_size);
     gtk_statusbar_pop(GTK_STATUSBAR(app->statusbar_pos), app->status_ctx);
     gtk_statusbar_push(GTK_STATUSBAR(app->statusbar_pos), app->status_ctx, msg);
     g_free(msg);
@@ -81,20 +95,34 @@ static void edit_action_free(gpointer data) {
     g_free(action);
 }
 
+static void edit_group_free(gpointer data) {
+    EditGroup *group = data;
+    g_list_free_full(group->actions, edit_action_free);
+    g_free(group);
+}
+
 static void clear_history_stack(GList **stack) {
-    g_list_free_full(*stack, edit_action_free);
+    g_list_free_full(*stack, edit_group_free);
     *stack = NULL;
 }
 
 static void trim_history_stack(GList **stack) {
-    const guint max_states = 100;
+    if (g_list_length(*stack) > 100) {
+        GList *last = g_list_last(*stack);
+        edit_group_free(last->data);
+        *stack = g_list_delete_link(*stack, last);
+    }
+}
 
-    if (g_list_length(*stack) <= max_states)
-        return;
+static void begin_user_action_cb(GtkTextBuffer *buffer, AppState *app) {
+    (void)buffer;
+    app->action_depth++;
+}
 
-    GList *last = g_list_last(*stack);
-    edit_action_free(last->data);
-    *stack = g_list_delete_link(*stack, last);
+static void end_user_action_cb(GtkTextBuffer *buffer, AppState *app) {
+    (void)buffer;
+    if (app->action_depth && --app->action_depth == 0)
+        app->active_group = NULL;
 }
 
 static gint text_char_count(const gchar *text, gint len) {
@@ -121,12 +149,25 @@ static void remember_edit_action(AppState *app, EditActionType type,
     action->offset = offset;
     action->text = len >= 0 ? g_strndup(text, len) : g_strdup(text);
 
-    app->undo_stack = g_list_prepend(app->undo_stack, action);
-    trim_history_stack(&app->undo_stack);
+    EditGroup *group = app->active_group;
+    if (!group) {
+        group = g_new0(EditGroup, 1);
+        group->before = app->revision;
+        group->after = ++app->next_revision;
+        app->undo_stack = g_list_prepend(app->undo_stack, group);
+        trim_history_stack(&app->undo_stack);
+        if (app->action_depth) app->active_group = group;
+    }
+    group->actions = g_list_prepend(group->actions, action);
+    app->revision = group->after;
     clear_history_stack(&app->redo_stack);
+    update_dirty(app);
 }
 
 static void reset_history(AppState *app) {
+    app->active_group = NULL;
+    app->action_depth = 0;
+    app->revision = app->saved_revision = app->next_revision = 0;
     clear_history_stack(&app->undo_stack);
     clear_history_stack(&app->redo_stack);
 }
@@ -139,7 +180,6 @@ static void apply_edit_action(AppState *app, EditAction *action, gboolean undo) 
 
     insert_text = (undo && action->type == EDIT_DELETE) ||
                   (!undo && action->type == EDIT_INSERT);
-    app->applying_history = TRUE;
     gtk_text_buffer_get_iter_at_offset(app->buffer, &start, action->offset);
     if (insert_text) {
         gtk_text_buffer_insert(app->buffer, &start, action->text, -1);
@@ -152,9 +192,6 @@ static void apply_edit_action(AppState *app, EditAction *action, gboolean undo) 
     }
     gtk_text_buffer_get_iter_at_offset(app->buffer, &start, cursor_offset);
     gtk_text_buffer_place_cursor(app->buffer, &start);
-    app->applying_history = FALSE;
-
-    mark_dirty(app);
     update_status(app);
     gtk_text_view_scroll_to_iter(GTK_TEXT_VIEW(app->textview), &start,
         0.1, FALSE, 0, 0);
@@ -163,26 +200,29 @@ static void apply_edit_action(AppState *app, EditAction *action, gboolean undo) 
 /* ---------------- Zoom ---------------- */
 
 static void apply_font_size(AppState *app) {
-    gchar *desc_str = g_strdup_printf("Courier %d", app->font_size);
-    PangoFontDescription *desc = pango_font_description_from_string(desc_str);
-    gtk_widget_override_font(app->textview, desc);
-    pango_font_description_free(desc);
-    g_free(desc_str);
+    pango_font_description_set_size(app->font, app->font_size);
+    gtk_widget_override_font(app->textview, app->font);
+    update_status(app);
 }
 
 static void zoom_in(AppState *app) {
-    if (app->font_size < 72) app->font_size += 1;
+    app->font_size = MIN(72 * PANGO_SCALE, app->font_size + PANGO_SCALE);
     apply_font_size(app);
 }
 
 static void zoom_out(AppState *app) {
-    if (app->font_size > 4) app->font_size -= 1;
+    app->font_size = MAX(4 * PANGO_SCALE, app->font_size - PANGO_SCALE);
     apply_font_size(app);
 }
 
 static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, AppState *app) {
     (void)widget;
     if (event->state & GDK_CONTROL_MASK) {
+        if (event->keyval == GDK_KEY_0 || event->keyval == GDK_KEY_KP_0) {
+            app->font_size = app->base_font_size;
+            apply_font_size(app);
+            return TRUE;
+        }
         if (event->keyval == GDK_KEY_plus || event->keyval == GDK_KEY_equal ||
             event->keyval == GDK_KEY_KP_Add) {
             zoom_in(app);
@@ -198,28 +238,45 @@ static gboolean on_key_press(GtkWidget *widget, GdkEventKey *event, AppState *ap
 
 static gboolean on_scroll(GtkWidget *widget, GdkEventScroll *event, AppState *app) {
     (void)widget;
-    if (event->state & GDK_CONTROL_MASK) {
-        if (event->direction == GDK_SCROLL_UP) {
-            zoom_in(app);
+    if (!(event->state & GDK_CONTROL_MASK)) {
+        app->scroll_zoom_delta = 0;
+        return FALSE;
+    }
+
+    if (event->direction == GDK_SCROLL_SMOOTH) {
+        /* Touchpads/high-resolution wheels send fractional vertical deltas. */
+        if (event->is_stop) {
+            app->scroll_zoom_delta = 0;
             return TRUE;
         }
-        if (event->direction == GDK_SCROLL_DOWN) {
-            zoom_out(app);
-            return TRUE;
+        if (event->time - app->last_scroll_time > 250 ||
+            event->delta_y * app->scroll_zoom_delta < 0)
+            app->scroll_zoom_delta = 0;
+        app->last_scroll_time = event->time;
+        app->scroll_zoom_delta = CLAMP(app->scroll_zoom_delta + event->delta_y, -68, 68);
+        gint steps = (gint)app->scroll_zoom_delta;
+        if (steps) {
+            app->scroll_zoom_delta -= steps;
+            app->font_size = CLAMP(app->font_size - steps * PANGO_SCALE,
+                                   4 * PANGO_SCALE, 72 * PANGO_SCALE);
+            apply_font_size(app);
         }
+        return TRUE;
+    }
+
+    app->scroll_zoom_delta = 0;
+    if (event->direction == GDK_SCROLL_UP) {
+        zoom_in(app);
+        return TRUE;
+    }
+    if (event->direction == GDK_SCROLL_DOWN) {
+        zoom_out(app);
+        return TRUE;
     }
     return FALSE;
 }
 
 /* ---------------- File operations ---------------- */
-
-static void buffer_changed_cb(GtkTextBuffer *buf, AppState *app) {
-    (void)buf;
-    if (app->applying_history)
-        return;
-
-    mark_dirty(app);
-}
 
 static void buffer_insert_text_cb(GtkTextBuffer *buf, GtkTextIter *location,
                                   gchar *text, gint len, AppState *app) {
@@ -245,33 +302,38 @@ static void cursor_moved_cb(GtkTextBuffer *buf, GParamSpec *pspec, AppState *app
     update_status(app);
 }
 
-static void set_buffer_text_from_file(AppState *app, const gchar *path) {
+static void set_buffer_text_from_file(AppState *app, const gchar *path,
+                                      gboolean allow_new) {
     gchar *contents = NULL;
     gsize len = 0;
     GError *err = NULL;
     if (!g_file_get_contents(path, &contents, &len, &err)) {
-        if (g_error_matches(err, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
-            g_free(app->filename);
-            app->filename = g_strdup(path);
-            app->dirty = FALSE;
-            reset_history(app);
-            update_title(app);
-            update_status(app);
+        if (allow_new && g_error_matches(err, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
+            g_clear_error(&err);
+            contents = g_strdup("");
+        } else {
+            GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(app->window),
+                GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+                "Could not open file:\n%s", err->message);
+            gtk_dialog_run(GTK_DIALOG(d));
+            gtk_widget_destroy(d);
             g_error_free(err);
             return;
         }
-
+    }
+    /* Reject unsupported input before changing the document or its filename. */
+    if (len > G_MAXINT || !g_utf8_validate(contents, len, NULL)) {
         GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(app->window),
             GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
-            "Could not open file:\n%s", err->message);
+            "Could not open file:\nExpected UTF-8 text without NUL bytes, smaller than 2 GiB.");
         gtk_dialog_run(GTK_DIALOG(d));
         gtk_widget_destroy(d);
-        g_error_free(err);
+        g_free(contents);
         return;
     }
-    g_signal_handlers_block_by_func(app->buffer, buffer_changed_cb, app);
+    app->applying_history = TRUE;
     gtk_text_buffer_set_text(app->buffer, contents, (gint)len);
-    g_signal_handlers_unblock_by_func(app->buffer, buffer_changed_cb, app);
+    app->applying_history = FALSE;
     g_free(contents);
 
     g_free(app->filename);
@@ -302,6 +364,8 @@ static gboolean save_to_file(AppState *app, const gchar *path) {
     }
     g_free(app->filename);
     app->filename = saved_path;
+    app->saved_revision = app->revision;
+    app->active_group = NULL;
     app->dirty = FALSE;
     update_title(app);
     return TRUE;
@@ -339,8 +403,8 @@ static gboolean maybe_save_changes(AppState *app) {
     gint resp = gtk_dialog_run(GTK_DIALOG(d));
     gtk_widget_destroy(d);
 
-    if (resp == GTK_RESPONSE_CANCEL) return FALSE;
     if (resp == GTK_RESPONSE_NO) return TRUE;
+    if (resp != GTK_RESPONSE_YES) return FALSE;
 
     if (app->filename)
         return save_to_file(app, app->filename);
@@ -361,7 +425,7 @@ static void on_open(GtkMenuItem *item, AppState *app) {
         "_Cancel", GTK_RESPONSE_CANCEL, "_Open", GTK_RESPONSE_ACCEPT, NULL);
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
         gchar *path = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
-        set_buffer_text_from_file(app, path);
+        set_buffer_text_from_file(app, path, FALSE);
         g_free(path);
     }
     gtk_widget_destroy(dlg);
@@ -481,32 +545,33 @@ static void on_file_exit(GtkMenuItem *item, AppState *app) {
 
 /* ---------------- Edit operations ---------------- */
 
+static void move_history(AppState *app, gboolean undo) {
+    GList **from = undo ? &app->undo_stack : &app->redo_stack;
+    GList **to = undo ? &app->redo_stack : &app->undo_stack;
+    if (!*from) return;
+
+    GList *head = *from;
+    EditGroup *group = head->data;
+    *from = g_list_delete_link(*from, head);
+    *to = g_list_prepend(*to, group);
+    app->active_group = NULL;
+    app->applying_history = TRUE;
+    for (GList *it = undo ? group->actions : g_list_last(group->actions);
+         it; it = undo ? it->next : it->prev)
+        apply_edit_action(app, it->data, undo);
+    app->applying_history = FALSE;
+    app->revision = undo ? group->before : group->after;
+    update_dirty(app);
+}
+
 static void on_undo(GtkMenuItem *item, AppState *app) {
     (void)item;
-
-    if (!app->undo_stack)
-        return;
-
-    GList *head = app->undo_stack;
-    EditAction *current = head->data;
-    app->undo_stack = g_list_delete_link(app->undo_stack, head);
-    app->redo_stack = g_list_prepend(app->redo_stack, current);
-
-    apply_edit_action(app, current, TRUE);
+    move_history(app, TRUE);
 }
 
 static void on_redo(GtkMenuItem *item, AppState *app) {
     (void)item;
-
-    if (!app->redo_stack)
-        return;
-
-    GList *head = app->redo_stack;
-    EditAction *next = head->data;
-    app->redo_stack = g_list_delete_link(app->redo_stack, head);
-    app->undo_stack = g_list_prepend(app->undo_stack, next);
-
-    apply_edit_action(app, next, FALSE);
+    move_history(app, FALSE);
 }
 
 static void on_cut(GtkMenuItem *item, AppState *app) {
@@ -543,7 +608,7 @@ static void on_delete(GtkMenuItem *item, AppState *app) {
         return;
 
     if (pos >= chars)
-        pos = chars - 1;
+        return;
 
     gtk_text_buffer_get_iter_at_offset(app->buffer, &start, pos);
     gtk_text_buffer_get_iter_at_offset(app->buffer, &end, pos + 1);
@@ -635,15 +700,20 @@ static void on_dialog_replace(GtkButton *btn, gpointer user_data) {
 
     GtkTextIter sel_start, sel_end;
     if (gtk_text_buffer_get_selection_bounds(app->buffer, &sel_start, &sel_end)) {
-        gchar *selected = gtk_text_buffer_get_text(app->buffer, &sel_start, &sel_end, FALSE);
-        gboolean matches = app->match_case
-            ? (strcmp(selected, app->find_text) == 0)
-            : (g_ascii_strcasecmp(selected, app->find_text) == 0);
-        g_free(selected);
+        GtkTextIter match_start, match_end;
+        GtkTextSearchFlags flags = GTK_TEXT_SEARCH_TEXT_ONLY;
+        if (!app->match_case) flags |= GTK_TEXT_SEARCH_CASE_INSENSITIVE;
+        gboolean matches = app->find_text && *app->find_text &&
+            gtk_text_iter_forward_search(&sel_start, app->find_text, flags,
+                &match_start, &match_end, &sel_end) &&
+            gtk_text_iter_equal(&match_start, &sel_start) &&
+            gtk_text_iter_equal(&match_end, &sel_end);
         if (matches) {
+            gtk_text_buffer_begin_user_action(app->buffer);
             gtk_text_buffer_delete(app->buffer, &sel_start, &sel_end);
             gtk_text_buffer_insert(app->buffer, &sel_start,
                                     app->replace_text ? app->replace_text : "", -1);
+            gtk_text_buffer_end_user_action(app->buffer);
         }
     }
     if (!find_next(app, TRUE)) report_not_found(dlg);
@@ -671,6 +741,7 @@ static void on_dialog_replace_all(GtkButton *btn, gpointer user_data) {
     GtkTextIter search_from, match_start, match_end;
     gtk_text_buffer_get_start_iter(app->buffer, &search_from);
 
+    gtk_text_buffer_begin_user_action(app->buffer);
     while (gtk_text_iter_forward_search(&search_from, app->find_text, flags,
                                          &match_start, &match_end, NULL)) {
         gtk_text_buffer_delete(app->buffer, &match_start, &match_end);
@@ -679,6 +750,7 @@ static void on_dialog_replace_all(GtkButton *btn, gpointer user_data) {
         count++;
         search_from = match_start;
     }
+    gtk_text_buffer_end_user_action(app->buffer);
 
     gchar *msg = g_strdup_printf("Replaced %d occurrence%s.", count, count == 1 ? "" : "s");
     GtkWidget *d = gtk_message_dialog_new(GTK_WINDOW(dlg),
@@ -802,14 +874,17 @@ static void on_word_wrap(GtkCheckMenuItem *item, AppState *app) {
 static void on_font(GtkMenuItem *item, AppState *app) {
     (void)item;
     GtkWidget *dlg = gtk_font_chooser_dialog_new("Choose Font", GTK_WINDOW(app->window));
+    gtk_font_chooser_set_font_desc(GTK_FONT_CHOOSER(dlg), app->font);
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_OK) {
-        gchar *fontname = gtk_font_chooser_get_font(GTK_FONT_CHOOSER(dlg));
-        PangoFontDescription *desc = pango_font_description_from_string(fontname);
-        gtk_widget_override_font(app->textview, desc);
-        gint size = pango_font_description_get_size(desc);
-        if (size > 0) app->font_size = size / PANGO_SCALE;
-        pango_font_description_free(desc);
-        g_free(fontname);
+        PangoFontDescription *desc = gtk_font_chooser_get_font_desc(GTK_FONT_CHOOSER(dlg));
+        if (desc) {
+            pango_font_description_free(app->font);
+            app->font = desc;
+            app->font_size = CLAMP(pango_font_description_get_size(desc),
+                                   4 * PANGO_SCALE, 72 * PANGO_SCALE);
+            app->base_font_size = app->font_size;
+            apply_font_size(app);
+        }
     }
     gtk_widget_destroy(dlg);
 }
@@ -834,11 +909,14 @@ static void on_about(GtkMenuItem *item, AppState *app) {
 }
 
 static void on_help_view(GtkMenuItem *item, AppState *app) {
-    (void)item;
+    (void)item; (void)app;
     GAppInfo *info = g_app_info_get_default_for_uri_scheme("https");
     GList *uris = NULL;
     uris = g_list_append(uris, "https://github.com/davepl");
-    if (info) g_app_info_launch_uris(info, uris, NULL, NULL);
+    if (info) {
+        g_app_info_launch_uris(info, uris, NULL, NULL);
+        g_object_unref(info);
+    }
     g_list_free(uris);
 }
 
@@ -872,6 +950,7 @@ static void on_window_destroy(GtkWidget *w, AppState *app) {
     g_free(app->filename);
     g_free(app->find_text);
     g_free(app->replace_text);
+    pango_font_description_free(app->font);
     clear_history_stack(&app->undo_stack);
     clear_history_stack(&app->redo_stack);
     g_free(app);
@@ -881,11 +960,12 @@ static void on_window_destroy(GtkWidget *w, AppState *app) {
         gtk_main_quit();
 }
 
-static GtkWidget *create_window(const gchar *path) {
+static AppState *create_window(const gchar *path) {
     AppState *app = g_new0(AppState, 1);
     app->show_status = TRUE;
     app->match_case = FALSE;
-    app->font_size = 10;
+    app->font_size = app->base_font_size = 10 * PANGO_SCALE;
+    app->font = pango_font_description_from_string("Monospace 10");
 
     app->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     open_windows++;
@@ -896,6 +976,7 @@ static GtkWidget *create_window(const gchar *path) {
 
     GtkAccelGroup *accel = gtk_accel_group_new();
     gtk_window_add_accel_group(GTK_WINDOW(app->window), accel);
+    g_object_unref(accel);
 
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(app->window), vbox);
@@ -934,7 +1015,7 @@ static GtkWidget *create_window(const gchar *path) {
     add_item(edit_menu, "_Go To...", G_CALLBACK(on_goto), app, "<Control>G", accel);
     add_separator(edit_menu);
     add_item(edit_menu, "Select _All", G_CALLBACK(on_select_all), app, "<Control>A", accel);
-    add_item(edit_menu, "Time/&Date", G_CALLBACK(on_insert_time), app, "F5", accel);
+    add_item(edit_menu, "Time/_Date", G_CALLBACK(on_insert_time), app, "F5", accel);
     gtk_menu_shell_append(GTK_MENU_SHELL(menubar), edit_item);
 
     GtkWidget *fmt_item = gtk_menu_item_new_with_mnemonic("F_ormat");
@@ -971,16 +1052,15 @@ static GtkWidget *create_window(const gchar *path) {
     gtk_container_add(GTK_CONTAINER(scroll), app->textview);
     app->buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(app->textview));
 
-    gtk_widget_add_events(app->textview, GDK_SCROLL_MASK);
+    gtk_widget_add_events(app->textview, GDK_SCROLL_MASK | GDK_SMOOTH_SCROLL_MASK);
     g_signal_connect(app->textview, "scroll-event", G_CALLBACK(on_scroll), app);
-
-    apply_font_size(app);
 
     g_signal_connect_after(app->buffer, "insert-text",
                             G_CALLBACK(buffer_insert_text_cb), app);
     g_signal_connect(app->buffer, "delete-range",
                       G_CALLBACK(buffer_delete_range_cb), app);
-    g_signal_connect(app->buffer, "changed", G_CALLBACK(buffer_changed_cb), app);
+    g_signal_connect(app->buffer, "begin-user-action", G_CALLBACK(begin_user_action_cb), app);
+    g_signal_connect(app->buffer, "end-user-action", G_CALLBACK(end_user_action_cb), app);
     g_signal_connect(app->buffer, "notify::cursor-position",
                       G_CALLBACK(cursor_moved_cb), app);
 
@@ -989,22 +1069,27 @@ static GtkWidget *create_window(const gchar *path) {
         GTK_STATUSBAR(app->statusbar_pos), "poscontext");
     gtk_box_pack_start(GTK_BOX(vbox), app->statusbar_pos, FALSE, FALSE, 0);
 
+    apply_font_size(app);
+    update_title(app);
     if (path) {
-        set_buffer_text_from_file(app, path);
+        set_buffer_text_from_file(app, path, TRUE);
     } else {
         reset_history(app);
         update_title(app);
     }
 
     gtk_widget_show_all(app->window);
+    gtk_widget_grab_focus(app->textview);
     update_status(app);
-    return app->window;
+    return app;
 }
 
 int main(int argc, char **argv) {
     gtk_init(&argc, &argv);
 
-    create_window(argc > 1 ? argv[1] : NULL);
+    gtk_window_set_default_icon_name("linotepad");
+    if (argc == 1) create_window(NULL);
+    for (int i = 1; i < argc; i++) create_window(argv[i]);
     gtk_main();
 
     return 0;
